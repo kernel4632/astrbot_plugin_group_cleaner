@@ -1,0 +1,237 @@
+{
+  "enabled": {
+    "description": "启用定时清理",
+    "hint": "总开关。白名单为空时定时器会空闲，不会动任何群。",
+    "type": "bool",
+    "default": true
+  },
+  "schedule_mode": {
+    "description": "定时模式",
+    "hint": "interval=按间隔重复；daily=每天固定时间执行一次",
+    "type": "string",
+    "options": ["interval", "daily"],
+    "default": "interval"
+  },
+  "interval_seconds": {
+    "description": "清理间隔（秒）",
+    "hint": "schedule_mode=interval 时生效。默认 604800（7天）",
+    "type": "int",
+    "slider": {"min": 3600, "max": 2592000, "step": 3600},
+    "default": 604800
+  },
+  "daily_time": {
+    "description": "每日执行时间",
+    "hint": "schedule_mode=daily 时生效，格式 HH:MM（24小时制）",
+    "type": "string",
+    "default": "04:00"
+  },
+  "timezone": {
+    "description": "时区",
+    "hint": "daily 模式计算下一次执行时间使用",
+    "type": "string",
+    "default": "Asia/Shanghai"
+  },
+  "run_on_startup": {
+    "description": "启动后立即扫描一次",
+    "hint": "默认关闭。打开后插件加载完成后立即执行一轮扫描",
+    "type": "bool",
+    "default": false
+  },
+  "stagger_groups_seconds": {
+    "description": "群间扫描间隔（秒）",
+    "hint": "一次扫描多个群时，每个群之间等待的秒数，避免接口被限流",
+    "type": "int",
+    "slider": {"min": 0, "max": 300, "step": 5},
+    "default": 30
+  },
+  "run_in_all_groups": {
+    "description": "对所有群生效",
+    "hint": "打开后忽略白名单，对 Bot 所在全部群执行（黑名单仍排除）。风险很高，默认关闭",
+    "type": "bool",
+    "default": false,
+    "obvious_hint": true
+  },
+  "group_whitelist": {
+    "description": "群白名单",
+    "hint": "只清理这些群号。默认空=不清理任何群，这是最安全的状态",
+    "type": "list",
+    "default": []
+  },
+  "group_blacklist": {
+    "description": "群黑名单",
+    "hint": "这些群永远不清理，即使开了全群模式",
+    "type": "list",
+    "default": []
+  },
+  "require_bot_admin": {
+    "description": "要求 Bot 是管理员",
+    "hint": "Bot 在群里不是群主/管理员时跳过该群（无法踢人，强行执行只会报错）",
+    "type": "bool",
+    "default": true
+  },
+  "inactive_days": {
+    "description": "默认不活跃天数",
+    "hint": "超过这么多天没发言的群友进入候选",
+    "type": "int",
+    "slider": {"min": 1, "max": 365, "step": 1},
+    "default": 30
+  },
+  "under_level": {
+    "description": "默认等级上限",
+    "hint": "群等级低于此值的群友进入候选；必须同时满足不活跃和低等级",
+    "type": "int",
+    "slider": {"min": 0, "max": 100, "step": 1},
+    "default": 10
+  },
+  "protect_recent_join_days": {
+    "description": "新人群友保护天数",
+    "hint": "进群不满这么多天的群友永不进入候选，设为 0 关闭保护",
+    "type": "int",
+    "slider": {"min": 0, "max": 180, "step": 1},
+    "default": 7
+  },
+  "protected_user_ids": {
+    "description": "受保护的 QQ 号",
+    "hint": "这些 QQ 永不进入候选（群主/管理员/Bot 自身本来就自动保护）",
+    "type": "list",
+    "default": []
+  },
+  "reject_add_request": {
+    "description": "踢出后拒绝再加群",
+    "hint": "对应 OneBot 的 reject_add_request 参数",
+    "type": "bool",
+    "default": false
+  },
+  "kick_delay_seconds": {
+    "description": "踢人间隔（秒）",
+    "hint": "连续踢人之间等待的秒数，避免接口限流",
+    "type": "int",
+    "slider": {"min": 0, "max": 10, "step": 1},
+    "default": 2
+  },
+  "max_kick_per_run": {
+    "description": "单轮踢人上限",
+    "hint": "一轮扫描最多实际踢出的人数，超出的留到下一轮；防止一次性清太多",
+    "type": "int",
+    "slider": {"min": 1, "max": 500, "step": 1},
+    "default": 50
+  },
+  "max_list_members": {
+    "description": "报告最多列出人数",
+    "hint": "候选名单太长时只显示前 N 个，其余用“等 N 人”概括",
+    "type": "int",
+    "slider": {"min": 10, "max": 300, "step": 10},
+    "default": 60
+  },
+  "auto_execute": {
+    "description": "到期自动执行",
+    "hint": "打开后提醒到期自动踢人；关闭则只发报告，踢人必须手动用 /清理执行",
+    "type": "bool",
+    "default": true,
+    "obvious_hint": true
+  },
+  "remind_enabled": {
+    "description": "发送清理预告",
+    "hint": "打开后，扫描到候选先发预告并@被列入的人，到期再执行；关闭后扫描到候选直接执行，只发执行报告",
+    "type": "bool",
+    "default": true
+  },
+  "remind_before_hours": {
+    "description": "清理前提醒提前量（小时）",
+    "hint": "预告发出后等待这么多小时再执行；以预告时的扫描快照为准，等待期间发言不影响结果。开启预告时生效",
+    "type": "int",
+    "slider": {"min": 0, "max": 72, "step": 1},
+    "default": 24
+  },
+  "confirm_keyword": {
+    "description": "确认关键词",
+    "hint": "管理员在群里发送此文本，立即执行当前待处理清理",
+    "type": "string",
+    "default": "确认清理"
+  },
+  "cancel_keyword": {
+    "description": "取消关键词",
+    "hint": "管理员在群里发送此文本，中止当前待处理清理",
+    "type": "string",
+    "default": "取消清理"
+  },
+  "manual_confirm_minutes": {
+    "description": "手动预览等待确认（分钟）",
+    "hint": "/清理预览 发出名单后，等待管理员回复确认关键词的时间；超时自动放弃",
+    "type": "int",
+    "slider": {"min": 1, "max": 120, "step": 1},
+    "default": 10
+  },
+  "operator_min_role": {
+    "description": "可操作清理的最低身份",
+    "hint": "能触发预览/确认/取消/执行的人。AstrBot 超管永远可以",
+    "type": "string",
+    "options": ["群主", "管理员"],
+    "default": "管理员"
+  },
+  "dry_run": {
+    "description": "演习模式",
+    "hint": "打开后只扫描和发报告，永远不真正踢人；用来验证规则",
+    "type": "bool",
+    "default": false,
+    "obvious_hint": true
+  },
+  "sweep_interval_seconds": {
+    "description": "后台检查间隔（秒）",
+    "hint": "后台任务每隔多久检查一次到期的扫描和执行；一般不用改",
+    "type": "int",
+    "slider": {"min": 30, "max": 600, "step": 30},
+    "default": 60
+  },
+  "state_retention_days": {
+    "description": "过期任务保留天数",
+    "hint": "超过执行时间这么多天还没处理的待处理任务会被标记过期清理",
+    "type": "int",
+    "slider": {"min": 1, "max": 30, "step": 1},
+    "default": 7
+  },
+  "group_overrides": {
+    "description": "群单独配置",
+    "hint": "某个群想用不同的天数/等级/开关时，在此添加；inherit_global 打开则完全跟随全局",
+    "type": "template_list",
+    "templates": {
+      "group": {
+        "name": "群单独配置",
+        "display_item": "group_id",
+        "items": {
+          "group_id": {
+            "description": "群号",
+            "hint": "纯数字 QQ 群号",
+            "type": "string",
+            "default": ""
+          },
+          "enabled": {
+            "description": "本群启用",
+            "hint": "关闭则跳过该群（即使在白名单里）",
+            "type": "bool",
+            "default": true
+          },
+          "inherit_global": {
+            "description": "跟随全局阈值",
+            "hint": "打开则忽略下面的天数和等级，用全局配置",
+            "type": "bool",
+            "default": true
+          },
+          "inactive_days": {
+            "description": "不活跃天数（本群）",
+            "hint": "设为 -1 表示跟随全局",
+            "type": "int",
+            "default": -1
+          },
+          "under_level": {
+            "description": "等级上限（本群）",
+            "hint": "设为 -1 表示跟随全局",
+            "type": "int",
+            "default": -1
+          }
+        }
+      }
+    },
+    "default": []
+  }
+}

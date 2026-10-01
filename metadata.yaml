@@ -3,7 +3,7 @@ name: astrbot_plugin_group_cleaner
 display_name: 定时群友清理
 short_desc: 定时扫描不活跃低等级群友，白名单保护，先提醒后自动清理
 desc: 从 QQ群管插件的清理逻辑独立而来，支持定时扫描、群白名单/黑名单、清理前提醒、管理员确认/取消、执行报告。白名单为空时只运行不动作；填入白名单后按提醒到期自动执行（可在面板关闭）。
-version: v1.1.0
+version: v1.1.1
 author: Kernyr
 repo: ""
 astrbot_version: ">=4.20.1"

@@ -442,15 +442,33 @@ class GroupCleanerPlugin(Star):
 
     async def _maybe_scheduled_scan(self, now: float) -> None:
         next_run = self.state.data.get("next_run_at")
-        if next_run is None:
+        fingerprint = self._schedule_fingerprint()
+        changed = self.state.data.get("schedule_fingerprint") != fingerprint
+        if next_run is None or not isinstance(next_run, (int, float)) or changed:
+            # 首次运行或调度配置（模式/时间/时区/间隔/启动策略）改动后，
+            # 立即按当前配置重算下次时间，避免改完还要等旧时间点。
             next_run = self._compute_initial_next_run(now)
             self.state.data["next_run_at"] = next_run
+            self.state.data["schedule_fingerprint"] = fingerprint
             self._save_state_quietly()
-        if not isinstance(next_run, (int, float)) or now < float(next_run):
+        if now < float(next_run):
             return
         await self._scheduled_scan(now)
         self.state.data["next_run_at"] = self._compute_next_after(now)
+        self.state.data["schedule_fingerprint"] = fingerprint
         self._save_state_quietly()
+
+    def _schedule_fingerprint(self) -> str:
+        """调度相关配置的指纹，用于检测配置变化后重算下次运行时间。"""
+        return "|".join(
+            [
+                cleaner.coerce_str(self._get("schedule_mode"), "interval"),
+                cleaner.coerce_str(self._get("daily_time"), "04:00"),
+                cleaner.coerce_str(self._get("timezone"), "Asia/Shanghai"),
+                str(cleaner.coerce_int(self._get("interval_seconds"), 604800)),
+                "startup" if cleaner.coerce_bool(self._get("run_on_startup"), False) else "",
+            ]
+        )
 
     def _compute_initial_next_run(self, now: float) -> float:
         if cleaner.coerce_bool(self._get("run_on_startup"), False):

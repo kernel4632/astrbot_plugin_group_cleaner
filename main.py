@@ -31,6 +31,12 @@ PLUGIN_NAME = "astrbot_plugin_group_cleaner"
 STATE_FILE = "state.json"
 MAX_MESSAGE_CHARS = 3900
 SWEEP_FALLBACK_SECONDS = 60
+# 单次 tick 的最长执行时间，防止某个 OneBot 调用丢失响应后把调度循环卡死
+TICK_TIMEOUT_SECONDS = 900
+# 错过定时点后允许补跑的宽限时间；超过则跳过本次、顺延到下一次
+MISSED_SCAN_GRACE_SECONDS = 3600
+# 到点但因 Bot 未连接而未能扫描时的重试间隔
+SCAN_RETRY_SECONDS = 300
 
 
 class GroupCleanerPlugin(Star):
@@ -44,12 +50,14 @@ class GroupCleanerPlugin(Star):
         self._scheduler_task: asyncio.Task | None = None
         self._run_lock = asyncio.Lock()
         self._clients_cache: dict[str, tuple[Any, str]] = {}
+        self._stopping = False
 
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
 
     async def initialize(self) -> None:
+        self._stopping = False
         self.state.load()
         if self.state.corrupted:
             logger.warning("[群友清理] 状态文件损坏，已重置为空状态")
@@ -75,7 +83,20 @@ class GroupCleanerPlugin(Star):
             self._scheduler_task = asyncio.create_task(self._scheduler_loop())
         logger.info("[群友清理] 定时群友清理插件已加载")
 
+    @filter.on_astrbot_loaded()
+    async def _on_astrbot_loaded(self) -> None:
+        """核心加载完成（平台通常已连接）后确保调度任务在运行。"""
+        self._ensure_scheduler()
+        logger.info("[群友清理] 平台已就绪，调度任务已确认运行")
+
+    def _ensure_scheduler(self) -> None:
+        if self._stopping:
+            return
+        if self._scheduler_task is None or self._scheduler_task.done():
+            self._scheduler_task = asyncio.create_task(self._scheduler_loop())
+
     async def terminate(self) -> None:
+        self._stopping = True
         if self._scheduler_task is not None:
             self._scheduler_task.cancel()
             try:
@@ -174,7 +195,9 @@ class GroupCleanerPlugin(Star):
             else:
                 parts.append(str(seg["data"].get("text", "")))
         try:
-            await cleaner.send_group_text(client, group_id, "".join(parts))
+            await asyncio.wait_for(
+                cleaner.send_group_text(client, group_id, "".join(parts)), timeout=30
+            )
             return True
         except Exception as exc:
             logger.error(f"[群友清理] CQ 码直发失败 {group_id}：{exc}")
@@ -376,24 +399,45 @@ class GroupCleanerPlugin(Star):
     # ------------------------------------------------------------------
 
     async def _scheduler_loop(self) -> None:
-        try:
-            while True:
-                try:
-                    await self._tick()
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    logger.error(f"[群友清理] 定时循环出错：{exc}")
-                await asyncio.sleep(
-                    max(30, cleaner.coerce_int(self._get("sweep_interval_seconds"), 60))
+        cancels = 0
+        while not self._stopping:
+            try:
+                await asyncio.wait_for(self._tick(), timeout=TICK_TIMEOUT_SECONDS)
+                cancels = 0
+            except asyncio.CancelledError:
+                if self._stopping:
+                    return
+                cancels += 1
+                if cancels >= 5:
+                    logger.error(
+                        "[群友清理] 调度任务连续多次被意外取消，放弃自愈并退出"
+                    )
+                    return
+                # 被外部意外取消：不要让定时器静默消失，稍后自愈重来
+                logger.warning(
+                    f"[群友清理] 调度任务被意外取消（第 {cancels} 次），1 秒后自动恢复"
                 )
-        except asyncio.CancelledError:
-            pass
+                try:
+                    await asyncio.sleep(1)
+                except asyncio.CancelledError:
+                    return
+                continue
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"[群友清理] 单次调度超过 {TICK_TIMEOUT_SECONDS}s 未结束，已放弃本轮并继续"
+                )
+            except Exception as exc:
+                logger.error(f"[群友清理] 定时循环出错：{exc}")
+            await asyncio.sleep(
+                max(30, cleaner.coerce_int(self._get("sweep_interval_seconds"), 60))
+            )
 
     async def _tick(self) -> None:
         if not cleaner.coerce_bool(self._get("enabled"), True):
             return
         now = time.time()
+        # 心跳：每个 tick 更新并落盘，便于从 state.json 的 mtime 判断调度是否存活
+        self.state.data["last_tick_at"] = now
         expired = self.state.expire_old_jobs(
             now, cleaner.coerce_int(self._get("state_retention_days"), 7)
         )
@@ -409,11 +453,10 @@ class GroupCleanerPlugin(Star):
                     "trigger": job.get("trigger", "schedule"),
                 }
             )
-        if expired:
-            self._save_state_quietly()
         async with self._run_lock:
             await self._process_due_executions(now)
             await self._maybe_scheduled_scan(now)
+        self._save_state_quietly()
 
     async def _process_due_executions(self, now: float) -> None:
         for key, job in list(self.state.data.get("jobs", {}).items()):
@@ -436,26 +479,57 @@ class GroupCleanerPlugin(Star):
                 client, bot_id, group_id, job, dry_run=False
             )
             try:
-                await cleaner.send_group_text(client, group_id, text)
+                await asyncio.wait_for(
+                    cleaner.send_group_text(client, group_id, text), timeout=30
+                )
             except Exception as exc:
                 logger.error(f"[群友清理] 执行报告发送失败 {group_id}：{exc}")
 
     async def _maybe_scheduled_scan(self, now: float) -> None:
-        next_run = self.state.data.get("next_run_at")
         fingerprint = self._schedule_fingerprint()
-        changed = self.state.data.get("schedule_fingerprint") != fingerprint
-        if next_run is None or not isinstance(next_run, (int, float)) or changed:
-            # 首次运行或调度配置（模式/时间/时区/间隔/启动策略）改动后，
-            # 立即按当前配置重算下次时间，避免改完还要等旧时间点。
-            next_run = self._compute_initial_next_run(now)
-            self.state.data["next_run_at"] = next_run
+        stored_fp = self.state.data.get("schedule_fingerprint")
+        next_run = self.state.data.get("next_run_at")
+
+        if next_run is None or not isinstance(next_run, (int, float)):
+            # 从未调度过：只有 run_on_startup 才立即跑，否则排到下一个时间点
+            self.state.data["next_run_at"] = self._compute_initial_next_run(now)
             self.state.data["schedule_fingerprint"] = fingerprint
             self._save_state_quietly()
-        if now < float(next_run):
             return
-        await self._scheduled_scan(now)
-        self.state.data["next_run_at"] = self._compute_next_after(now)
-        self.state.data["schedule_fingerprint"] = fingerprint
+
+        if stored_fp != fingerprint:
+            # 调度配置改动：按新配置顺延到下一个时间点（不在改配置时立刻执行）
+            self.state.data["schedule_fingerprint"] = fingerprint
+            self.state.data["next_run_at"] = self._compute_next_after(now)
+            logger.info("[群友清理] 调度配置已变更，下次运行时间已按新配置重算")
+            self._save_state_quietly()
+            return
+
+        due = float(next_run)
+        if now < due:
+            return
+
+        if now - due > MISSED_SCAN_GRACE_SECONDS:
+            logger.info(
+                f"[群友清理] 错过定时扫描（晚了 {int(now - due)}s），"
+                "跳过本次并顺延到下一次"
+            )
+            self.state.data["next_run_at"] = self._compute_next_after(now)
+            self._save_state_quietly()
+            return
+
+        scanned = await self._scheduled_scan(now)
+        if scanned:
+            self.state.data["next_run_at"] = self._compute_next_after(now)
+        else:
+            # 到点了但 Bot 未连接/无目标群可扫，稍后重试（超过宽限期则顺延）
+            retry = now + SCAN_RETRY_SECONDS
+            if retry - due > MISSED_SCAN_GRACE_SECONDS:
+                retry = self._compute_next_after(now)
+            self.state.data["next_run_at"] = retry
+            logger.warning(
+                f"[群友清理] 本次未实际扫描（Bot 未就绪），{int(retry - now)}s 后重试"
+            )
         self._save_state_quietly()
 
     def _schedule_fingerprint(self) -> str:
@@ -493,15 +567,24 @@ class GroupCleanerPlugin(Star):
     # 扫描与执行
     # ------------------------------------------------------------------
 
-    async def _scheduled_scan(self, now: float) -> None:
+    async def _scheduled_scan(self, now: float) -> bool:
+        """执行一轮定时扫描。
+
+        返回是否真的进行了扫描（False 表示 Bot 尚未就绪，调用方会稍后重试）。
+        """
         bots = await self._bots()
         if not bots:
             logger.warning("[群友清理] 没有可用的 aiocqhttp Bot，跳过本轮扫描")
-            return
+            return False
         discovered: list[str] = []
-        for _, client, _pid in bots:
+        for client, _bot_id, _pid in bots:
             try:
-                groups = await cleaner.discover_groups(client)
+                groups = await asyncio.wait_for(
+                    cleaner.discover_groups(client), timeout=30
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[群友清理] 获取群列表超时")
+                continue
             except Exception as exc:
                 logger.warning(f"[群友清理] 获取群列表失败：{exc}")
                 continue
@@ -520,7 +603,7 @@ class GroupCleanerPlugin(Star):
                 {"ts": now, "stage": "idle", "trigger": "schedule", "note": "无目标群"}
             )
             self._save_state_quietly()
-            return
+            return True
         stagger = max(0, cleaner.coerce_int(self._get("stagger_groups_seconds"), 30))
         first = True
         for group_id in sorted(set(targets)):
@@ -541,13 +624,16 @@ class GroupCleanerPlugin(Star):
                     }
                 )
         self._save_state_quietly()
+        return True
 
     async def _client_for_group(
         self, bots: list[tuple[Any, str, str]], group_id: str
     ) -> tuple[Any, str, str] | None:
         for client, bot_id, platform_id in bots:
             try:
-                groups = await cleaner.discover_groups(client)
+                groups = await asyncio.wait_for(
+                    cleaner.discover_groups(client), timeout=30
+                )
             except Exception:
                 continue
             if group_id in groups:
@@ -564,7 +650,9 @@ class GroupCleanerPlugin(Star):
             if bot_id and candidate_bot != bot_id:
                 continue
             try:
-                groups = await cleaner.discover_groups(client)
+                groups = await asyncio.wait_for(
+                    cleaner.discover_groups(client), timeout=30
+                )
             except Exception:
                 continue
             if group_id in groups:
@@ -611,7 +699,12 @@ class GroupCleanerPlugin(Star):
             )
             return
         if cleaner.coerce_bool(self._get("require_bot_admin"), True):
-            role = await cleaner.fetch_member_role(client, group_id, bot_id)
+            try:
+                role = await asyncio.wait_for(
+                    cleaner.fetch_member_role(client, group_id, bot_id), timeout=30
+                )
+            except Exception:
+                role = ""
             if role not in {"owner", "admin"}:
                 logger.info(
                     f"[群友清理] Bot 在群 {group_id} 不是管理员（{role}），跳过"
@@ -627,7 +720,9 @@ class GroupCleanerPlugin(Star):
                 )
                 return
         try:
-            members = await cleaner.fetch_members(client, group_id)
+            members = await asyncio.wait_for(
+                cleaner.fetch_members(client, group_id), timeout=60
+            )
         except Exception as exc:
             raise RuntimeError(f"拉取群成员失败：{exc}") from exc
         candidates, stats = cleaner.select_candidates(
@@ -725,8 +820,9 @@ class GroupCleanerPlugin(Star):
             self._save_state_quietly()
             return
         # 提醒关闭（或提前量为 0）：扫描到就直接执行，只发执行报告
-        async with self._run_lock:
-            text = await self._execute_job(client, bot_id, group_id, job, dry_run)
+        # 注意：调用链 _tick -> _maybe_scheduled_scan -> _scheduled_scan 已持有
+        # _run_lock（asyncio.Lock 不可重入），这里绝不能再加锁，否则会死锁。
+        text = await self._execute_job(client, bot_id, group_id, job, dry_run)
         try:
             await cleaner.send_group_text(client, group_id, self._clip(text))
         except Exception as exc:
@@ -759,7 +855,9 @@ class GroupCleanerPlugin(Star):
             login_id = await cleaner.fetch_bot_id(client)
         except Exception:
             login_id = ""
-        members = await cleaner.fetch_members(client, group_id)
+        members = await asyncio.wait_for(
+            cleaner.fetch_members(client, group_id), timeout=60
+        )
         candidates, stats = cleaner.select_candidates(
             members,
             now_ts=time.time(),
@@ -844,12 +942,19 @@ class GroupCleanerPlugin(Star):
             self._persist(job, "cancelled", trigger=job.get("trigger", "schedule"))
             return f"【定时清理】群 {group_id} 已被单独关闭，本次清理自动中止"
         if cleaner.coerce_bool(self._get("require_bot_admin"), True):
-            role = await cleaner.fetch_member_role(client, group_id, bot_id)
+            try:
+                role = await asyncio.wait_for(
+                    cleaner.fetch_member_role(client, group_id, bot_id), timeout=30
+                )
+            except Exception:
+                role = ""
             if role not in {"owner", "admin"}:
                 job["stage"] = "failed"
                 self._persist(job, "failed", trigger=job.get("trigger", "schedule"))
                 return f"【定时清理】群 {group_id} 执行中止：Bot 当前不是管理员（{role or '未知'}）"
-        members = await cleaner.fetch_members(client, group_id)
+        members = await asyncio.wait_for(
+            cleaner.fetch_members(client, group_id), timeout=60
+        )
         to_kick, gone, exempted = cleaner.reconcile_execution(
             job.get("candidates") or [], members, bot_id=bot_id
         )
@@ -875,7 +980,9 @@ class GroupCleanerPlugin(Star):
                 kicked.append(label + "（演习）")
                 continue
             try:
-                await cleaner.kick_member(client, group_id, uid, reject)
+                await asyncio.wait_for(
+                    cleaner.kick_member(client, group_id, uid, reject), timeout=30
+                )
                 kicked.append(label)
             except Exception as exc:
                 logger.error(f"[群友清理] 踢出失败 {group_id}/{uid}：{exc}")
